@@ -1,18 +1,18 @@
 {
   "name": "roblox-proxy",
   "version": "1.0.0",
-  "description": "Roblox Asset Bundle Proxy on Render",
+  "description": "Roblox Asset Bundle Proxy",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^2.6.7",
-    "https-proxy-agent": "^5.0.1",
+    "node-fetch": "2.6.7",
+    "https-proxy-agent": "5.0.1",
     "dotenv": "^16.0.3"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=16.0.0"
   }
 }
