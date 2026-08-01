@@ -1,6 +1,8 @@
 require("dotenv").config();
 
 const express = require("express");
+const fetch = require("node-fetch");
+const HttpsProxyAgent = require("https-proxy-agent");
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -10,17 +12,53 @@ const PROXY_KEY =
   process.env.PROXY_KEY ||
   "";
 
+const WEBSHARE_PROXY_URL =
+  process.env.WEBSHARE_PROXY_URL || "";
+
 const UPSTREAM_TIMEOUT_MS =
-  Number(process.env.UPSTREAM_TIMEOUT_MS) || 5000;
+  Number(process.env.UPSTREAM_TIMEOUT_MS) || 7000;
 
 const MAX_PRICE_ITEMS = 100;
 const MAX_PARENT_ASSETS = 5;
 
-const PARENT_CACHE_BASE_MS = 60 * 60 * 1000;
-const PARENT_CACHE_JITTER = 0.10;
-const MAX_PARENT_CACHE_ENTRIES = 10000;
+let webshareAgent = null;
+let proxyConfigurationError = null;
 
-const parentCache = new Map();
+if (WEBSHARE_PROXY_URL) {
+  try {
+    const parsedProxyUrl = new URL(WEBSHARE_PROXY_URL);
+
+    if (
+      parsedProxyUrl.protocol !== "http:" &&
+      parsedProxyUrl.protocol !== "https:"
+    ) {
+      throw new Error(
+        `unsupported proxy protocol: ${parsedProxyUrl.protocol}`
+      );
+    }
+
+    webshareAgent = new HttpsProxyAgent(
+      WEBSHARE_PROXY_URL
+    );
+
+    console.log(
+      `Webshare proxy configured: ${parsedProxyUrl.hostname}:${parsedProxyUrl.port}`
+    );
+  } catch (error) {
+    proxyConfigurationError =
+      String(error?.message || error);
+
+    console.error(
+      "Invalid WEBSHARE_PROXY_URL:",
+      proxyConfigurationError
+    );
+  }
+} else {
+  proxyConfigurationError =
+    "WEBSHARE_PROXY_URL is not configured";
+
+  console.warn(proxyConfigurationError);
+}
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "128kb" }));
@@ -29,9 +67,12 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "content-type, x-proxy-key, x-bypass-worker-cache"
+    "content-type, x-proxy-key"
   );
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS"
+  );
   res.setHeader(
     "Access-Control-Expose-Headers",
     [
@@ -39,7 +80,8 @@ app.use((req, res, next) => {
       "x-upstream-ratelimit-remaining",
       "x-upstream-ratelimit-reset",
       "x-upstream-retry-after",
-      "x-upstream-status"
+      "x-upstream-status",
+      "x-proxy-enabled"
     ].join(", ")
   );
 
@@ -50,6 +92,13 @@ app.use((req, res, next) => {
   next();
 });
 
+function asyncRoute(handler) {
+  return function wrappedRoute(req, res, next) {
+    Promise.resolve(handler(req, res, next))
+      .catch(next);
+  };
+}
+
 function requireProxyKey(req, res, next) {
   if (!PROXY_KEY) {
     return res.status(503).json({
@@ -58,7 +107,8 @@ function requireProxyKey(req, res, next) {
     });
   }
 
-  const suppliedKey = req.get("x-proxy-key") || "";
+  const suppliedKey =
+    req.get("x-proxy-key") || "";
 
   if (suppliedKey !== PROXY_KEY) {
     return res.status(401).json({
@@ -70,10 +120,16 @@ function requireProxyKey(req, res, next) {
   next();
 }
 
-function asyncRoute(handler) {
-  return function wrappedRoute(req, res, next) {
-    Promise.resolve(handler(req, res, next)).catch(next);
-  };
+function requireWebshareProxy(req, res, next) {
+  if (!webshareAgent) {
+    return res.status(503).json({
+      ok: false,
+      code: "webshare_proxy_not_configured",
+      details: proxyConfigurationError
+    });
+  }
+
+  next();
 }
 
 function positiveInteger(value) {
@@ -90,8 +146,19 @@ function positiveInteger(value) {
 }
 
 function finiteNumber(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
+
   const number = Number(value);
-  return Number.isFinite(number) ? number : null;
+
+  return Number.isFinite(number)
+    ? number
+    : null;
 }
 
 function splitHeaderValues(value) {
@@ -116,12 +183,12 @@ function parseRetryAfter(value) {
     return Math.max(0, Math.ceil(seconds));
   }
 
-  const timestamp = Date.parse(value);
+  const dateValue = Date.parse(value);
 
-  if (Number.isFinite(timestamp)) {
+  if (Number.isFinite(dateValue)) {
     return Math.max(
       0,
-      Math.ceil((timestamp - Date.now()) / 1000)
+      Math.ceil((dateValue - Date.now()) / 1000)
     );
   }
 
@@ -129,11 +196,7 @@ function parseRetryAfter(value) {
 }
 
 function safeBodySnippet(text) {
-  if (!text) {
-    return "";
-  }
-
-  const cleaned = String(text)
+  const cleaned = String(text || "")
     .replace(/[\r\n\t]+/g, " ")
     .trim();
 
@@ -144,12 +207,21 @@ function safeBodySnippet(text) {
   return `${cleaned.slice(0, 1000)}...<truncated>`;
 }
 
-function captureRateLimit(response, metadata = {}) {
-  const limit = response.headers.get("x-ratelimit-limit");
-  const remaining = response.headers.get("x-ratelimit-remaining");
-  const reset = response.headers.get("x-ratelimit-reset");
-  const retryAfter = response.headers.get("retry-after");
-  const csrfToken = response.headers.get("x-csrf-token");
+function captureRateLimit(response, metadata) {
+  const limit =
+    response.headers.get("x-ratelimit-limit");
+
+  const remaining =
+    response.headers.get("x-ratelimit-remaining");
+
+  const reset =
+    response.headers.get("x-ratelimit-reset");
+
+  const retryAfter =
+    response.headers.get("retry-after");
+
+  const csrfToken =
+    response.headers.get("x-csrf-token");
 
   return {
     endpoint: metadata.endpoint,
@@ -177,6 +249,8 @@ function applyRateLimitHeaders(res, info) {
   if (!info) {
     return;
   }
+
+  res.setHeader("x-proxy-enabled", "webshare");
 
   if (info.limit) {
     res.setHeader(
@@ -212,20 +286,31 @@ function applyRateLimitHeaders(res, info) {
   );
 }
 
-async function fetchWithTimeout(url, options = {}) {
+async function fetchThroughWebshare(
+  url,
+  options = {}
+) {
+  if (!webshareAgent) {
+    throw new Error(
+      proxyConfigurationError ||
+      "webshare_proxy_unavailable"
+    );
+  }
+
   const controller = new AbortController();
 
-  const timer = setTimeout(() => {
+  const timeout = setTimeout(() => {
     controller.abort();
   }, UPSTREAM_TIMEOUT_MS);
 
   try {
     return await fetch(url, {
       ...options,
+      agent: webshareAgent,
       signal: controller.signal
     });
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timeout);
   }
 }
 
@@ -235,19 +320,19 @@ async function readResponseBody(response) {
   if (!text) {
     return {
       text: "",
-      data: null
+      json: null
     };
   }
 
   try {
     return {
       text,
-      data: JSON.parse(text)
+      json: JSON.parse(text)
     };
   } catch {
     return {
       text,
-      data: null
+      json: null
     };
   }
 }
@@ -269,45 +354,7 @@ function normalizeItemType(value) {
   };
 }
 
-function normalizePriceItems(rawItems) {
-  const normalized = [];
-  const seen = new Set();
-
-  for (const rawItem of rawItems) {
-    if (!rawItem || typeof rawItem !== "object") {
-      continue;
-    }
-
-    const id = positiveInteger(rawItem.id ?? rawItem.Id);
-
-    if (!id) {
-      continue;
-    }
-
-    const itemType = normalizeItemType(
-      rawItem.itemType ?? rawItem.ItemType
-    );
-
-    const key = `${itemType.name}:${id}`;
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-
-    normalized.push({
-      id,
-      key,
-      itemTypeName: itemType.name,
-      itemTypeValue: itemType.value
-    });
-  }
-
-  return normalized;
-}
-
-function getDetailPriceStatus(detail) {
+function inferPriceStatus(detail, price) {
   if (
     typeof detail.priceStatus === "string" &&
     detail.priceStatus
@@ -316,33 +363,36 @@ function getDetailPriceStatus(detail) {
   }
 
   if (Array.isArray(detail.itemStatus)) {
-    const saleStatus = detail.itemStatus.find(status =>
-      String(status).toLowerCase().includes("sale")
+    const status = detail.itemStatus.find(value =>
+      String(value).toLowerCase().includes("sale")
     );
 
-    if (saleStatus) {
-      return String(saleStatus);
+    if (status) {
+      return String(status);
     }
   }
 
-  return null;
+  return price !== null
+    ? "On Sale"
+    : "Off Sale";
 }
 
-function inferForSale(explicitValue, priceStatus, price) {
-  if (typeof explicitValue === "boolean") {
-    return explicitValue;
+function inferForSale(explicit, status, price) {
+  if (typeof explicit === "boolean") {
+    return explicit;
   }
 
-  const status = String(priceStatus || "").toLowerCase();
+  const normalized =
+    String(status || "").toLowerCase();
 
   if (
-    status.includes("off sale") ||
-    status.includes("not for sale")
+    normalized.includes("off sale") ||
+    normalized.includes("not for sale")
   ) {
     return false;
   }
 
-  if (status.includes("on sale")) {
+  if (normalized.includes("on sale")) {
     return true;
   }
 
@@ -350,7 +400,7 @@ function inferForSale(explicitValue, priceStatus, price) {
 }
 
 async function requestCatalogDetails(items) {
-  const requestBody = JSON.stringify({
+  const body = JSON.stringify({
     items: items.map(item => ({
       itemType: item.itemTypeValue,
       id: item.id
@@ -360,11 +410,13 @@ async function requestCatalogDetails(items) {
   const attempts = [];
   let csrfToken = null;
 
+  // 같은 Webshare 프록시 agent를 사용하므로
+  // CSRF 재요청도 같은 프록시를 통과합니다.
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const headers = {
       "Accept": "application/json",
       "Content-Type": "application/json",
-      "User-Agent": "RobloxCatalogProxy/2.0"
+      "User-Agent": "RobloxCatalogProxy/2.1"
     };
 
     if (csrfToken) {
@@ -373,26 +425,28 @@ async function requestCatalogDetails(items) {
 
     const startedAt = Date.now();
 
-    const response = await fetchWithTimeout(
+    const response = await fetchThroughWebshare(
       "https://catalog.roblox.com/v1/catalog/items/details",
       {
         method: "POST",
         headers,
-        body: requestBody
+        body
       }
     );
 
-    const elapsedMs = Date.now() - startedAt;
-
-    const diagnostic = captureRateLimit(response, {
-      endpoint: "catalog-items-details",
-      attempt,
-      elapsedMs
-    });
+    const diagnostic = captureRateLimit(
+      response,
+      {
+        endpoint: "catalog-items-details",
+        attempt,
+        elapsedMs: Date.now() - startedAt
+      }
+    );
 
     attempts.push(diagnostic);
 
-    const body = await readResponseBody(response);
+    const responseBody =
+      await readResponseBody(response);
 
     const returnedCsrfToken =
       response.headers.get("x-csrf-token");
@@ -408,32 +462,85 @@ async function requestCatalogDetails(items) {
 
     return {
       response,
-      data: body.data,
-      text: body.text,
+      responseBody,
       attempts,
       diagnostic
     };
   }
 
-  throw new Error("catalog_details_attempts_exhausted");
+  throw new Error(
+    "catalog_details_attempts_exhausted"
+  );
 }
+
+app.get(
+  "/v1/proxy-test",
+  requireProxyKey,
+  requireWebshareProxy,
+  asyncRoute(async (req, res) => {
+    const startedAt = Date.now();
+
+    let response;
+
+    try {
+      response = await fetchThroughWebshare(
+        "https://api.ipify.org?format=json",
+        {
+          method: "GET",
+          headers: {
+            "Accept": "application/json",
+            "User-Agent":
+              "RobloxCatalogProxy/2.1"
+          }
+        }
+      );
+    } catch (error) {
+      return res.status(502).json({
+        ok: false,
+        code: "proxy_connection_failed",
+        details: String(
+          error?.message || error
+        )
+      });
+    }
+
+    const body = await readResponseBody(response);
+
+    if (!response.ok) {
+      return res.status(502).json({
+        ok: false,
+        code: "proxy_ip_check_failed",
+        upstreamStatus: response.status,
+        upstreamBody:
+          safeBodySnippet(body.text)
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      proxyEnabled: true,
+      provider: "Webshare",
+      exitIp: body.json?.ip || null,
+      elapsedMs: Date.now() - startedAt
+    });
+  })
+);
 
 app.post(
   "/v1/catalog-prices",
   requireProxyKey,
+  requireWebshareProxy,
   asyncRoute(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
 
-    const rawItems = req.body?.items;
-
-    if (!Array.isArray(rawItems)) {
+    if (!Array.isArray(req.body?.items)) {
       return res.status(400).json({
         ok: false,
         code: "items_must_be_an_array"
       });
     }
 
-    if (rawItems.length > MAX_PRICE_ITEMS) {
+    if (req.body.items.length > MAX_PRICE_ITEMS) {
       return res.status(400).json({
         ok: false,
         code: "too_many_items",
@@ -441,7 +548,37 @@ app.post(
       });
     }
 
-    const items = normalizePriceItems(rawItems);
+    const items = [];
+    const seen = new Set();
+
+    for (const rawItem of req.body.items) {
+      const id = positiveInteger(
+        rawItem?.id ?? rawItem?.Id
+      );
+
+      if (!id) {
+        continue;
+      }
+
+      const itemType = normalizeItemType(
+        rawItem.itemType ?? rawItem.ItemType
+      );
+
+      const key = `${itemType.name}:${id}`;
+
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+
+      items.push({
+        id,
+        key,
+        itemTypeName: itemType.name,
+        itemTypeValue: itemType.value
+      });
+    }
 
     if (items.length === 0) {
       return res.status(400).json({
@@ -453,53 +590,66 @@ app.post(
     let upstream;
 
     try {
-      upstream = await requestCatalogDetails(items);
+      upstream =
+        await requestCatalogDetails(items);
     } catch (error) {
       return res.status(502).json({
         ok: false,
-        code: "upstream_fetch_failed",
-        details: String(error?.message || error)
+        code: "proxy_or_upstream_failed",
+        proxyEnabled: true,
+        details: String(
+          error?.message || error
+        )
       });
     }
 
-    applyRateLimitHeaders(res, upstream.diagnostic);
+    applyRateLimitHeaders(
+      res,
+      upstream.diagnostic
+    );
 
     if (!upstream.response.ok) {
-      const status =
-        upstream.response.status === 429 ? 429 : 502;
-
-      return res.status(status).json({
+      return res.status(
+        upstream.response.status === 429
+          ? 429
+          : 502
+      ).json({
         ok: false,
         code:
           upstream.response.status === 429
             ? "upstream_rate_limited"
             : "upstream_http_error",
-        upstreamStatus: upstream.response.status,
+        proxyEnabled: true,
+        upstreamStatus:
+          upstream.response.status,
         retryAfterSeconds:
           upstream.diagnostic.retryAfterSeconds,
-        upstreamRateLimit: upstream.diagnostic,
-        upstreamAttempts: upstream.attempts,
-        upstreamBody: safeBodySnippet(upstream.text)
+        upstreamRateLimit:
+          upstream.diagnostic,
+        upstreamAttempts:
+          upstream.attempts,
+        upstreamBody: safeBodySnippet(
+          upstream.responseBody.text
+        )
       });
     }
 
-    const details = Array.isArray(upstream.data?.data)
-      ? upstream.data.data
-      : Array.isArray(upstream.data)
-        ? upstream.data
+    const rawJson =
+      upstream.responseBody.json;
+
+    const details = Array.isArray(rawJson?.data)
+      ? rawJson.data
+      : Array.isArray(rawJson)
+        ? rawJson
         : [];
 
     const requestedByKey = new Map(
       items.map(item => [item.key, item])
     );
 
-    const requestedById = new Map();
-
-    for (const item of items) {
-      if (!requestedById.has(item.id)) {
-        requestedById.set(item.id, item);
-      }
-    }
+    const requestedById = new Map(
+      items.map(item => [item.id, item])
+    );
 
     const prices = {};
 
@@ -512,51 +662,58 @@ app.post(
     let returnedCount = 0;
 
     for (const detail of details) {
-      if (!detail || typeof detail !== "object") {
-        continue;
-      }
-
-      const id = positiveInteger(detail.id);
+      const id = positiveInteger(detail?.id);
 
       if (!id) {
         continue;
       }
 
-      const detailType = normalizeItemType(detail.itemType);
-      const detailKey = `${detailType.name}:${id}`;
+      const responseItemType =
+        normalizeItemType(detail.itemType);
+
+      const responseKey =
+        `${responseItemType.name}:${id}`;
 
       const requestedItem =
-        requestedByKey.get(detailKey) ||
+        requestedByKey.get(responseKey) ||
         requestedById.get(id);
 
       if (!requestedItem) {
         continue;
       }
 
-      const publicBasePrice = finiteNumber(detail.price);
-      const lowestPrice = finiteNumber(detail.lowestPrice);
-      const priceStatus = getDetailPriceStatus(detail);
+      const publicBasePrice =
+        finiteNumber(detail.price);
 
-      const isForSale = inferForSale(
-        detail.isForSale,
-        priceStatus,
-        publicBasePrice
-      );
+      const lowestPrice =
+        finiteNumber(detail.lowestPrice);
+
+      const priceStatus =
+        inferPriceStatus(
+          detail,
+          publicBasePrice
+        );
+
+      const isForSale =
+        inferForSale(
+          detail.isForSale,
+          priceStatus,
+          publicBasePrice
+        );
 
       const entry = {
-        isForSale
+        isForSale,
+        priceStatus
       };
 
       if (publicBasePrice !== null) {
-        entry.publicBasePrice = publicBasePrice;
+        entry.publicBasePrice =
+          publicBasePrice;
       }
 
       if (lowestPrice !== null) {
-        entry.lowestPrice = lowestPrice;
-      }
-
-      if (priceStatus) {
-        entry.priceStatus = priceStatus;
+        entry.lowestPrice =
+          lowestPrice;
       }
 
       prices[requestedItem.key] = entry;
@@ -565,108 +722,37 @@ app.post(
 
     return res.status(200).json({
       ok: true,
+      proxyEnabled: true,
+      provider: "Webshare",
       requestedCount: items.length,
       returnedCount,
-      upstreamRequestCount: upstream.attempts.length,
-      fetchedAt: Math.floor(Date.now() / 1000),
-      upstreamRateLimit: upstream.diagnostic,
-      upstreamAttempts: upstream.attempts,
+      upstreamRequestCount:
+        upstream.attempts.length,
+      fetchedAt:
+        Math.floor(Date.now() / 1000),
+      upstreamRateLimit:
+        upstream.diagnostic,
+      upstreamAttempts:
+        upstream.attempts,
       prices
     });
   })
 );
 
-function parentCacheTtlMs() {
-  const jitter =
-    1 +
-    ((Math.random() * 2 - 1) * PARENT_CACHE_JITTER);
-
-  return Math.round(PARENT_CACHE_BASE_MS * jitter);
-}
-
-function getCachedParent(assetId) {
-  const cached = parentCache.get(assetId);
-
-  if (!cached) {
-    return null;
-  }
-
-  if (cached.expiresAt <= Date.now()) {
-    parentCache.delete(assetId);
-    return null;
-  }
-
-  return {
-    ...cached.value,
-    cacheHit: true
-  };
-}
-
-function setCachedParent(assetId, value) {
-  if (
-    parentCache.size >= MAX_PARENT_CACHE_ENTRIES &&
-    !parentCache.has(assetId)
-  ) {
-    const oldestKey = parentCache.keys().next().value;
-
-    if (oldestKey !== undefined) {
-      parentCache.delete(oldestKey);
-    }
-  }
-
-  parentCache.set(assetId, {
-    expiresAt: Date.now() + parentCacheTtlMs(),
-    value: {
-      ...value,
-      cacheHit: false
-    }
-  });
-}
-
-function normalizeParentIds(rawIds) {
-  const normalized = [];
-  const seen = new Set();
-
-  for (const rawId of rawIds) {
-    const id = positiveInteger(rawId);
-
-    if (!id || seen.has(id)) {
-      continue;
-    }
-
-    seen.add(id);
-    normalized.push(id);
-  }
-
-  return normalized;
-}
-
-async function requestParentBundle(assetId, bypassCache) {
-  if (!bypassCache) {
-    const cached = getCachedParent(assetId);
-
-    if (cached) {
-      return {
-        entry: cached,
-        upstreamRequestCount: 0,
-        rateLimit: null
-      };
-    }
-  }
-
-  const fetchedAt = Math.floor(Date.now() / 1000);
+async function requestParentBundle(assetId) {
   const startedAt = Date.now();
 
   let response;
 
   try {
-    response = await fetchWithTimeout(
+    response = await fetchThroughWebshare(
       `https://catalog.roblox.com/v1/assets/${assetId}/bundles`,
       {
         method: "GET",
         headers: {
           "Accept": "application/json",
-          "User-Agent": "RobloxCatalogProxy/2.0"
+          "User-Agent":
+            "RobloxCatalogProxy/2.1"
         }
       }
     );
@@ -674,26 +760,28 @@ async function requestParentBundle(assetId, bypassCache) {
     return {
       entry: {
         state: "failed",
-        code: "upstream_fetch_failed",
+        code: "proxy_connection_failed",
         retryable: true,
-        details: String(error?.message || error),
-        fetchedAt,
+        details: String(
+          error?.message || error
+        ),
         cacheHit: false
       },
-      upstreamRequestCount: 1,
       rateLimit: null
     };
   }
 
-  const elapsedMs = Date.now() - startedAt;
+  const diagnostic = captureRateLimit(
+    response,
+    {
+      endpoint: "asset-parent-bundles",
+      attempt: 1,
+      elapsedMs: Date.now() - startedAt
+    }
+  );
 
-  const rateLimit = captureRateLimit(response, {
-    endpoint: "asset-parent-bundles",
-    attempt: 1,
-    elapsedMs
-  });
-
-  const body = await readResponseBody(response);
+  const responseBody =
+    await readResponseBody(response);
 
   if (!response.ok) {
     return {
@@ -706,23 +794,21 @@ async function requestParentBundle(assetId, bypassCache) {
         retryable:
           response.status === 429 ||
           response.status >= 500,
-        retryAfterSeconds:
-          rateLimit.retryAfterSeconds,
         upstreamStatus: response.status,
-        upstreamBody: safeBodySnippet(body.text),
-        upstreamRateLimit: rateLimit,
-        fetchedAt,
+        retryAfterSeconds:
+          diagnostic.retryAfterSeconds,
+        upstreamBody:
+          safeBodySnippet(responseBody.text),
+        upstreamRateLimit: diagnostic,
         cacheHit: false
       },
-      upstreamRequestCount: 1,
-      rateLimit
+      rateLimit: diagnostic
     };
   }
 
-  const bundles = Array.isArray(body.data?.data)
-    ? body.data.data
-    : Array.isArray(body.data)
-      ? body.data
+  const bundles =
+    Array.isArray(responseBody.json?.data)
+      ? responseBody.json.data
       : null;
 
   if (!bundles) {
@@ -731,32 +817,27 @@ async function requestParentBundle(assetId, bypassCache) {
         state: "failed",
         code: "invalid_upstream_response",
         retryable: true,
-        upstreamRateLimit: rateLimit,
-        upstreamBody: safeBodySnippet(body.text),
-        fetchedAt,
+        upstreamBody:
+          safeBodySnippet(responseBody.text),
+        upstreamRateLimit: diagnostic,
         cacheHit: false
       },
-      upstreamRequestCount: 1,
-      rateLimit
+      rateLimit: diagnostic
     };
   }
 
+  const fetchedAt =
+    Math.floor(Date.now() / 1000);
+
   if (bundles.length === 0) {
-    const entry = {
-      state: "none",
-      fetchedAt,
-      cacheHit: false
-    };
-
-    setCachedParent(assetId, entry);
-
     return {
       entry: {
-        ...entry,
-        upstreamRateLimit: rateLimit
+        state: "none",
+        fetchedAt,
+        cacheHit: false,
+        upstreamRateLimit: diagnostic
       },
-      upstreamRequestCount: 1,
-      rateLimit
+      rateLimit: diagnostic
     };
   }
 
@@ -769,12 +850,11 @@ async function requestParentBundle(assetId, bypassCache) {
         state: "failed",
         code: "invalid_bundle_id",
         retryable: true,
-        upstreamRateLimit: rateLimit,
         fetchedAt,
-        cacheHit: false
+        cacheHit: false,
+        upstreamRateLimit: diagnostic
       },
-      upstreamRequestCount: 1,
-      rateLimit
+      rateLimit: diagnostic
     };
   }
 
@@ -808,91 +888,47 @@ async function requestParentBundle(assetId, bypassCache) {
     publicBasePrice
   );
 
-  const priceStatus =
-    rawPriceStatus ||
-    (isForSale ? "On Sale" : "Off Sale");
-
   const entry = {
     state: "found",
     bundleId,
     isForSale,
-    priceStatus,
+    priceStatus:
+      rawPriceStatus ||
+      (isForSale ? "On Sale" : "Off Sale"),
     fetchedAt,
-    cacheHit: false
+    cacheHit: false,
+    upstreamRateLimit: diagnostic
   };
 
   if (publicBasePrice !== null) {
-    entry.publicBasePrice = publicBasePrice;
+    entry.publicBasePrice =
+      publicBasePrice;
   }
-
-  setCachedParent(assetId, entry);
 
   return {
-    entry: {
-      ...entry,
-      upstreamRateLimit: rateLimit
-    },
-    upstreamRequestCount: 1,
-    rateLimit
+    entry,
+    rateLimit: diagnostic
   };
-}
-
-function primaryRemaining(info) {
-  if (!info || !Array.isArray(info.remainingValues)) {
-    return Number.POSITIVE_INFINITY;
-  }
-
-  for (const rawValue of info.remainingValues) {
-    const number = Number(rawValue);
-
-    if (Number.isFinite(number)) {
-      return number;
-    }
-  }
-
-  return Number.POSITIVE_INFINITY;
-}
-
-function selectRateLimitSummary(infos) {
-  const available = infos.filter(Boolean);
-
-  if (available.length === 0) {
-    return null;
-  }
-
-  available.sort((left, right) => {
-    const leftLimited = left.status === 429 ? 0 : 1;
-    const rightLimited = right.status === 429 ? 0 : 1;
-
-    if (leftLimited !== rightLimited) {
-      return leftLimited - rightLimited;
-    }
-
-    return (
-      primaryRemaining(left) -
-      primaryRemaining(right)
-    );
-  });
-
-  return available[0];
 }
 
 app.post(
   "/v1/parent-bundles",
   requireProxyKey,
+  requireWebshareProxy,
   asyncRoute(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
 
-    const rawAssetIds = req.body?.assetIds;
-
-    if (!Array.isArray(rawAssetIds)) {
+    if (!Array.isArray(req.body?.assetIds)) {
       return res.status(400).json({
         ok: false,
         code: "assetIds_must_be_an_array"
       });
     }
 
-    if (rawAssetIds.length > MAX_PARENT_ASSETS) {
+    if (
+      req.body.assetIds.length >
+      MAX_PARENT_ASSETS
+    ) {
       return res.status(400).json({
         ok: false,
         code: "too_many_asset_ids",
@@ -900,7 +936,20 @@ app.post(
       });
     }
 
-    const assetIds = normalizeParentIds(rawAssetIds);
+    const assetIds = [];
+    const seen = new Set();
+
+    for (const rawId of req.body.assetIds) {
+      const assetId =
+        positiveInteger(rawId);
+
+      if (!assetId || seen.has(assetId)) {
+        continue;
+      }
+
+      seen.add(assetId);
+      assetIds.push(assetId);
+    }
 
     if (assetIds.length === 0) {
       return res.status(400).json({
@@ -909,40 +958,34 @@ app.post(
       });
     }
 
-    const bypassCache =
-      req.body?.bypassCache === true ||
-      req.get("x-bypass-worker-cache") === "true";
-
-    // 최대 5개의 Roblox GET을 동시에 실행합니다.
     const lookups = await Promise.all(
       assetIds.map(assetId =>
-        requestParentBundle(assetId, bypassCache)
+        requestParentBundle(assetId)
       )
     );
 
     const results = {};
     const upstreamRateLimits = {};
 
-    let cacheHitCount = 0;
-    let upstreamRequestCount = 0;
     let rateLimited = false;
+    let summary = null;
 
-    for (let index = 0; index < assetIds.length; index += 1) {
+    for (
+      let index = 0;
+      index < assetIds.length;
+      index += 1
+    ) {
       const assetId = assetIds[index];
       const lookup = lookups[index];
 
-      results[String(assetId)] = lookup.entry;
-
-      if (lookup.entry.cacheHit) {
-        cacheHitCount += 1;
-      }
-
-      upstreamRequestCount +=
-        lookup.upstreamRequestCount;
+      results[String(assetId)] =
+        lookup.entry;
 
       if (lookup.rateLimit) {
         upstreamRateLimits[String(assetId)] =
           lookup.rateLimit;
+
+        summary = lookup.rateLimit;
 
         if (lookup.rateLimit.status === 429) {
           rateLimited = true;
@@ -950,20 +993,21 @@ app.post(
       }
     }
 
-    const summary = selectRateLimitSummary(
-      lookups.map(lookup => lookup.rateLimit)
-    );
-
     applyRateLimitHeaders(res, summary);
 
     return res.status(200).json({
       ok: true,
+      proxyEnabled: true,
+      provider: "Webshare",
       requestedCount: assetIds.length,
-      cacheHitCount,
-      upstreamRequestCount,
-      fetchedAt: Math.floor(Date.now() / 1000),
+      cacheHitCount: 0,
+      upstreamRequestCount:
+        assetIds.length,
+      fetchedAt:
+        Math.floor(Date.now() / 1000),
       rateLimited,
-      upstreamRateLimitSummary: summary || undefined,
+      upstreamRateLimitSummary:
+        summary || undefined,
       upstreamRateLimits,
       results
     });
@@ -974,8 +1018,15 @@ app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "roblox-catalog-proxy",
-    version: "2.0.0",
+    version: "2.1.0",
+    webshareProxyConfigured:
+      Boolean(webshareAgent),
+    proxyConfigurationError:
+      webshareAgent
+        ? undefined
+        : proxyConfigurationError,
     endpoints: [
+      "GET /v1/proxy-test",
       "POST /v1/catalog-prices",
       "POST /v1/parent-bundles",
       "GET /ping"
@@ -992,30 +1043,22 @@ app.use((error, req, res, next) => {
     return next(error);
   }
 
-  console.error("Unhandled request error:", error);
-
-  if (error?.type === "entity.too.large") {
-    return res.status(413).json({
-      ok: false,
-      code: "request_body_too_large"
-    });
-  }
+  console.error(
+    "Unhandled request error:",
+    error
+  );
 
   return res.status(500).json({
     ok: false,
     code: "internal_server_error",
-    details: String(error?.message || error)
+    details: String(
+      error?.message || error
+    )
   });
 });
 
 app.listen(port, "0.0.0.0", () => {
   console.log(
-    `Roblox catalog proxy listening on port ${port}`
+    `Roblox catalog proxy 2.1.0 listening on port ${port}`
   );
-
-  if (!PROXY_KEY) {
-    console.warn(
-      "CATALOG_PROXY_KEY/PROXY_KEY is not configured."
-    );
-  }
 });
