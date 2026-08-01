@@ -6,6 +6,7 @@ const HttpsProxyAgent = require("https-proxy-agent");
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
+const SERVICE_VERSION = "3.1.0";
 
 const PROXY_KEY =
   process.env.CATALOG_PROXY_KEY ||
@@ -92,15 +93,39 @@ const ENABLE_RENDER_DIRECT = parseBoolean(
   true
 );
 
-// Use 1 on an ordinary Render service. Use 3 only after assigning a
-// three-address Render dedicated outbound IP set. These are scheduler lanes;
-// Render itself still decides which of its assigned IPs carries a connection.
-const RENDER_DIRECT_LANES = clampInteger(
+const ENABLE_CLOUDFLARE = parseBoolean(
+  process.env.ENABLE_CLOUDFLARE,
+  true
+);
+
+const CLOUDFLARE_PROVIDER_URL = String(
+  process.env.CLOUDFLARE_PROVIDER_URL ||
+    "https://roblox-asset.rhlekarkdtl.workers.dev"
+).replace(/\/+$/, "");
+
+const JOB_TIMEOUT_MS = clampInteger(
+  process.env.JOB_TIMEOUT_MS,
+  4500,
+  1000,
+  30000
+);
+
+const PROVIDER_ATTEMPT_TIMEOUT_MS = clampInteger(
+  process.env.PROVIDER_ATTEMPT_TIMEOUT_MS,
+  2000,
+  250,
+  15000
+);
+
+// Render's logical lanes shared one observed outbound IP and one rate-limit
+// bucket. Keep exactly one Render slot even if the old environment value is 3.
+const REQUESTED_RENDER_DIRECT_LANES = clampInteger(
   process.env.RENDER_DIRECT_LANES,
   1,
   1,
   16
 );
+const RENDER_DIRECT_LANES = 1;
 
 const webshareUrls = deduplicate([
   ...parseStringList(process.env.WEBSHARE_PROXY_LIST),
@@ -361,11 +386,27 @@ function applyRateLimitHeaders(res, info, providerId) {
   }
 }
 
-async function fetchWithTimeout(url, options = {}) {
+function timeoutForDeadline(deadlineAt) {
+  const remaining = Number(deadlineAt) - Date.now();
+  return Math.max(
+    1,
+    Math.min(
+      UPSTREAM_TIMEOUT_MS,
+      PROVIDER_ATTEMPT_TIMEOUT_MS,
+      remaining
+    )
+  );
+}
+
+async function fetchWithTimeout(
+  url,
+  options = {},
+  timeoutMs = UPSTREAM_TIMEOUT_MS
+) {
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(),
-    UPSTREAM_TIMEOUT_MS
+    Math.max(1, Number(timeoutMs) || UPSTREAM_TIMEOUT_MS)
   );
   try {
     return await fetch(url, {
@@ -525,8 +566,28 @@ function addProvider(provider) {
     lastRateLimit: null,
     lastError: null,
     requestCount: 0,
+    priority: 99,
+    supportsPrice: true,
+    supportsParent: true,
     ...provider
   });
+}
+
+if (ENABLE_CLOUDFLARE) {
+  try {
+    const parsed = new URL(CLOUDFLARE_PROVIDER_URL);
+    addProvider({
+      id: "cloudflare",
+      type: "remote",
+      baseUrl: parsed.origin,
+      priority: 1
+    });
+  } catch (error) {
+    console.error(
+      "Skipping invalid Cloudflare provider URL:",
+      String(error?.message || error)
+    );
+  }
 }
 
 if (ENABLE_RENDER_DIRECT) {
@@ -534,7 +595,8 @@ if (ENABLE_RENDER_DIRECT) {
     addProvider({
       id: `render-direct-${lane}`,
       type: "local",
-      agent: undefined
+      agent: undefined,
+      priority: 2
     });
   }
 }
@@ -549,7 +611,10 @@ for (let index = 0; index < webshareUrls.length; index += 1) {
     addProvider({
       id: `webshare-${index + 1}`,
       type: "local",
-      agent: new HttpsProxyAgent(proxyUrl)
+      agent: new HttpsProxyAgent(proxyUrl),
+      priority: 3,
+      supportsPrice: false,
+      supportsParent: true
     });
   } catch (error) {
     console.error(
@@ -576,7 +641,8 @@ for (let index = 0; index < remoteProviderSpecs.length; index += 1) {
       addProvider({
         id: `${spec.name}-lane-${lane}`,
         type: "remote",
-        baseUrl: parsed.origin
+        baseUrl: parsed.origin,
+        priority: 2
       });
     }
   } catch (error) {
@@ -620,7 +686,7 @@ function updateProviderState(provider, result) {
   }
 }
 
-async function requestLocalPrice(provider, items) {
+async function requestLocalPrice(provider, items, deadlineAt) {
   const requestBody = JSON.stringify({
     items: items.map(item => ({
       itemType: item.itemTypeValue,
@@ -630,10 +696,20 @@ async function requestLocalPrice(provider, items) {
 
   const attempts = [];
   for (let attempt = 1; attempt <= 2; attempt += 1) {
+    if (Date.now() >= deadlineAt) {
+      return {
+        ok: false,
+        statusCode: 504,
+        errorCode: "job_deadline_exceeded",
+        rateLimit: attempts[attempts.length - 1] || null,
+        body: { ok: false, code: "job_deadline_exceeded" }
+      };
+    }
+
     const headers = {
       Accept: "application/json",
       "Content-Type": "application/json",
-      "User-Agent": "RobloxCatalogProviderPool/3.0"
+      "User-Agent": `RobloxCatalogProviderPool/${SERVICE_VERSION}`
     };
     if (provider.csrfToken) {
       headers["x-csrf-token"] = provider.csrfToken;
@@ -649,7 +725,8 @@ async function requestLocalPrice(provider, items) {
           headers,
           body: requestBody,
           agent: provider.agent
-        }
+        },
+        timeoutForDeadline(deadlineAt)
       );
     } catch (error) {
       return {
@@ -732,7 +809,7 @@ async function requestLocalPrice(provider, items) {
   };
 }
 
-async function requestLocalParent(provider, assetId) {
+async function requestLocalParent(provider, assetId, deadlineAt) {
   let response;
   const startedAt = Date.now();
   try {
@@ -742,10 +819,11 @@ async function requestLocalParent(provider, assetId) {
         method: "GET",
         headers: {
           Accept: "application/json",
-          "User-Agent": "RobloxCatalogProviderPool/3.0"
+          "User-Agent": `RobloxCatalogProviderPool/${SERVICE_VERSION}`
         },
         agent: provider.agent
-      }
+      },
+      timeoutForDeadline(deadlineAt)
     );
   } catch (error) {
     return {
@@ -885,19 +963,29 @@ async function requestLocalParent(provider, assetId) {
   };
 }
 
-async function requestRemote(provider, path, payload, endpoint) {
+async function requestRemote(
+  provider,
+  path,
+  payload,
+  endpoint,
+  deadlineAt
+) {
   let response;
   try {
-    response = await fetchWithTimeout(`${provider.baseUrl}${path}`, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "x-proxy-key": PROXY_KEY,
-        "User-Agent": "RobloxCatalogProviderPool/3.0"
+    response = await fetchWithTimeout(
+      `${provider.baseUrl}${path}`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "x-proxy-key": PROXY_KEY,
+          "User-Agent": `RobloxCatalogProviderPool/${SERVICE_VERSION}`
+        },
+        body: JSON.stringify(payload)
       },
-      body: JSON.stringify(payload)
-    });
+      timeoutForDeadline(deadlineAt)
+    );
   } catch (error) {
     return {
       ok: false,
@@ -918,8 +1006,11 @@ async function requestRemote(provider, path, payload, endpoint) {
     responseBody.json,
     endpoint
   );
+  const validJson =
+    responseBody.json !== null &&
+    typeof responseBody.json === "object";
   return {
-    ok: response.ok && responseBody.json?.ok !== false,
+    ok: response.ok && validJson && responseBody.json?.ok !== false,
     statusCode: response.status,
     errorCode:
       responseBody.json?.code ||
@@ -934,19 +1025,25 @@ async function requestRemote(provider, path, payload, endpoint) {
   };
 }
 
-async function executeJob(provider, job) {
+async function executeJob(provider, job, deadlineAt) {
   if (provider.type === "remote") {
     if (job.kind === "price") {
       const remote = await requestRemote(
         provider,
         "/v1/catalog-prices",
         { items: job.items },
-        "remote-catalog-prices"
+        "remote-catalog-prices",
+        deadlineAt
       );
       return {
-        ok: remote.ok,
+        ok:
+          remote.ok &&
+          remote.decoded?.prices &&
+          typeof remote.decoded.prices === "object",
         statusCode: remote.statusCode,
-        errorCode: remote.errorCode,
+        errorCode:
+          remote.errorCode ||
+          (remote.decoded?.prices ? null : "missing_remote_prices"),
         rateLimit: remote.rateLimit,
         body: remote.decoded
       };
@@ -956,131 +1053,317 @@ async function executeJob(provider, job) {
       provider,
       "/v1/parent-bundles",
       { assetIds: [job.assetId], bypassCache: true },
-      "remote-parent-bundles"
+      "remote-parent-bundles",
+      deadlineAt
     );
+    const entry =
+      remote.decoded?.results?.[String(job.assetId)] || {
+        state: "failed",
+        code: remote.errorCode || "missing_remote_result",
+        retryable: true
+      };
+    const entryFailed =
+      String(entry.state || "").toLowerCase() === "failed";
     return {
-      ok: remote.ok,
+      ok: remote.ok && !entryFailed,
       statusCode: remote.statusCode,
-      errorCode: remote.errorCode,
+      errorCode:
+        remote.errorCode ||
+        (entryFailed ? entry.code || "remote_entry_failed" : null),
       rateLimit: remote.rateLimit,
-      entry:
-        remote.decoded?.results?.[String(job.assetId)] || {
-          state: "failed",
-          code: remote.errorCode || "missing_remote_result",
-          retryable: true
-        }
+      entry
     };
   }
 
   return job.kind === "price"
-    ? requestLocalPrice(provider, job.items)
-    : requestLocalParent(provider, job.assetId);
+    ? requestLocalPrice(provider, job.items, deadlineAt)
+    : requestLocalParent(provider, job.assetId, deadlineAt);
 }
 
 const requestQueue = [];
-let roundRobinCursor = 0;
+let webshareCursor = 0;
 let wakeTimer = null;
+let wakeAt = 0;
 
-function selectAvailableProvider() {
-  if (providers.length === 0) {
+function providerSupportsJob(provider, job) {
+  return job.kind === "price"
+    ? provider.supportsPrice
+    : provider.supportsParent;
+}
+
+function providerIsAvailable(provider, queued, now) {
+  return (
+    providerSupportsJob(provider, queued.job) &&
+    !queued.attemptedProviderIds.has(provider.id) &&
+    !provider.busy &&
+    provider.cooldownUntil <= now
+  );
+}
+
+function selectAvailableProvider(queued) {
+  const now = Date.now();
+  const available = providers.filter(provider =>
+    providerIsAvailable(provider, queued, now)
+  );
+  if (available.length === 0) {
     return null;
   }
-  const now = Date.now();
-  for (let offset = 0; offset < providers.length; offset += 1) {
-    const index = (roundRobinCursor + offset) % providers.length;
-    const provider = providers[index];
-    if (!provider.busy && provider.cooldownUntil <= now) {
-      roundRobinCursor = (index + 1) % providers.length;
+
+  const highestPriority = Math.min(
+    ...available.map(provider => provider.priority)
+  );
+  const samePriority = available.filter(
+    provider => provider.priority === highestPriority
+  );
+
+  if (highestPriority !== 3) {
+    return samePriority[0];
+  }
+
+  const webshares = providers.filter(
+    provider => provider.priority === 3
+  );
+  for (let offset = 0; offset < webshares.length; offset += 1) {
+    const index = (webshareCursor + offset) % webshares.length;
+    const provider = webshares[index];
+    if (samePriority.includes(provider)) {
+      webshareCursor = (index + 1) % webshares.length;
       return provider;
     }
   }
-  return null;
+
+  return samePriority[0];
 }
 
-function scheduleWakeForCooldown() {
-  if (wakeTimer || requestQueue.length === 0) {
+function providerCanBecomeAvailable(provider, queued) {
+  if (
+    !providerSupportsJob(provider, queued.job) ||
+    queued.attemptedProviderIds.has(provider.id)
+  ) {
+    return false;
+  }
+  return provider.busy || provider.cooldownUntil < queued.deadlineAt;
+}
+
+function attachDebugTrace(queued, result) {
+  if (!queued.job.debug) {
+    return result;
+  }
+  return {
+    ...result,
+    providerAttempts: queued.providerAttempts
+  };
+}
+
+function makeDeadlineResult(queued) {
+  const last = queued.lastResult;
+  return attachDebugTrace(queued, {
+    providerId: last?.providerId || null,
+    ok: false,
+    statusCode: 504,
+    errorCode: "job_deadline_exceeded",
+    rateLimit: last?.rateLimit || null,
+    body: {
+      ok: false,
+      code: "job_deadline_exceeded"
+    },
+    entry: {
+      state: "failed",
+      code: "job_deadline_exceeded",
+      retryable: true
+    }
+  });
+}
+
+function makeNoProviderResult(queued) {
+  if (queued.lastResult) {
+    return attachDebugTrace(queued, queued.lastResult);
+  }
+  return attachDebugTrace(queued, {
+    providerId: null,
+    ok: false,
+    statusCode: 503,
+    errorCode: "no_providers_available",
+    rateLimit: null,
+    body: { ok: false, code: "no_providers_available" },
+    entry: {
+      state: "failed",
+      code: "no_providers_available",
+      retryable: true
+    }
+  });
+}
+
+function settleUnserviceableJobs() {
+  const now = Date.now();
+  for (let index = requestQueue.length - 1; index >= 0; index -= 1) {
+    const queued = requestQueue[index];
+    if (now >= queued.deadlineAt) {
+      requestQueue.splice(index, 1);
+      queued.resolve(makeDeadlineResult(queued));
+      continue;
+    }
+
+    const hasFutureProvider = providers.some(provider =>
+      providerCanBecomeAvailable(provider, queued)
+    );
+    if (!hasFutureProvider) {
+      requestQueue.splice(index, 1);
+      queued.resolve(makeNoProviderResult(queued));
+    }
+  }
+}
+
+function scheduleWake() {
+  if (requestQueue.length === 0) {
     return;
   }
+
   const now = Date.now();
-  const availableTimes = providers
-    .filter(provider => !provider.busy)
-    .map(provider => provider.cooldownUntil)
-    .filter(timestamp => timestamp > now);
+  const availableTimes = [];
+  for (const queued of requestQueue) {
+    availableTimes.push(queued.deadlineAt);
+    for (const provider of providers) {
+      if (
+        providerSupportsJob(provider, queued.job) &&
+        !queued.attemptedProviderIds.has(provider.id) &&
+        !provider.busy &&
+        provider.cooldownUntil > now &&
+        provider.cooldownUntil < queued.deadlineAt
+      ) {
+        availableTimes.push(provider.cooldownUntil);
+      }
+    }
+  }
+
   if (availableTimes.length === 0) {
     return;
   }
-  const delay = Math.max(1, Math.min(...availableTimes) - now);
+
+  const nextWake = Math.min(...availableTimes);
+  if (wakeTimer && wakeAt <= nextWake) {
+    return;
+  }
+  if (wakeTimer) {
+    clearTimeout(wakeTimer);
+  }
+  wakeAt = nextWake;
+  const delay = Math.max(1, nextWake - now);
   wakeTimer = setTimeout(() => {
     wakeTimer = null;
+    wakeAt = 0;
     pumpQueue();
   }, delay);
 }
 
-function pumpQueue() {
-  if (providers.length === 0) {
-    while (requestQueue.length > 0) {
-      requestQueue.shift().resolve({
-        providerId: null,
+function providerStateSnapshot() {
+  const now = Date.now();
+  return providers.map(provider => ({
+    id: provider.id,
+    priority: provider.priority,
+    state: provider.busy
+      ? "busy"
+      : provider.cooldownUntil > now
+        ? "cooldown"
+        : "idle"
+  }));
+}
+
+function runQueuedJob(queued, provider) {
+  const selectionState = queued.job.debug
+    ? providerStateSnapshot()
+    : undefined;
+  provider.busy = true;
+  const attemptStartedAt = Date.now();
+
+  executeJob(provider, queued.job, queued.deadlineAt)
+    .catch(error => ({
+      ok: false,
+      statusCode: 502,
+      errorCode: "unhandled_provider_error",
+      rateLimit: null,
+      body: {
         ok: false,
-        statusCode: 503,
-        errorCode: "no_providers_configured",
-        rateLimit: null,
-        body: { ok: false, code: "no_providers_configured" },
-        entry: {
-          state: "failed",
-          code: "no_providers_configured",
-          retryable: true
-        }
-      });
-    }
-    return;
-  }
+        code: "unhandled_provider_error",
+        details: String(error?.message || error)
+      },
+      entry: {
+        state: "failed",
+        code: "unhandled_provider_error",
+        retryable: true
+      }
+    }))
+    .then(result => {
+      const completed = {
+        providerId: provider.id,
+        ...result
+      };
+      updateProviderState(provider, result);
+      provider.busy = false;
+
+      queued.attemptedProviderIds.add(provider.id);
+      queued.lastResult = completed;
+      if (queued.job.debug) {
+        queued.providerAttempts.push({
+          attempt: queued.providerAttempts.length + 1,
+          providerId: provider.id,
+          priority: provider.priority,
+          elapsedMs: Date.now() - attemptStartedAt,
+          ok: result.ok,
+          statusCode: result.statusCode,
+          errorCode: result.errorCode || null,
+          selectionState
+        });
+      }
+
+      if (result.ok) {
+        queued.resolve(attachDebugTrace(queued, completed));
+      } else if (Date.now() >= queued.deadlineAt) {
+        queued.resolve(makeDeadlineResult(queued));
+      } else {
+        // A failed request is retried before new work. Provider selection starts
+        // at priority 1 again using the states that exist at this moment.
+        requestQueue.unshift(queued);
+      }
+      pumpQueue();
+    });
+}
+
+function pumpQueue() {
+  settleUnserviceableJobs();
 
   while (requestQueue.length > 0) {
-    const provider = selectAvailableProvider();
-    if (!provider) {
-      scheduleWakeForCooldown();
+    let assignment = null;
+    for (let index = 0; index < requestQueue.length; index += 1) {
+      const queued = requestQueue[index];
+      const provider = selectAvailableProvider(queued);
+      if (provider) {
+        assignment = { index, queued, provider };
+        break;
+      }
+    }
+
+    if (!assignment) {
+      scheduleWake();
       return;
     }
 
-    const queued = requestQueue.shift();
-    provider.busy = true;
-    executeJob(provider, queued.job)
-      .then(result => {
-        updateProviderState(provider, result);
-        queued.resolve({ providerId: provider.id, ...result });
-      })
-      .catch(error => {
-        const result = {
-          providerId: provider.id,
-          ok: false,
-          statusCode: 502,
-          errorCode: "unhandled_provider_error",
-          rateLimit: null,
-          body: {
-            ok: false,
-            code: "unhandled_provider_error",
-            details: String(error?.message || error)
-          },
-          entry: {
-            state: "failed",
-            code: "unhandled_provider_error",
-            retryable: true
-          }
-        };
-        updateProviderState(provider, result);
-        queued.resolve(result);
-      })
-      .finally(() => {
-        provider.busy = false;
-        pumpQueue();
-      });
+    requestQueue.splice(assignment.index, 1);
+    runQueuedJob(assignment.queued, assignment.provider);
   }
 }
 
 function enqueueJob(job) {
   return new Promise(resolve => {
-    requestQueue.push({ job, resolve });
+    const now = Date.now();
+    requestQueue.push({
+      job,
+      resolve,
+      deadlineAt: now + JOB_TIMEOUT_MS,
+      attemptedProviderIds: new Set(),
+      providerAttempts: [],
+      lastResult: null
+    });
     pumpQueue();
   });
 }
@@ -1102,7 +1385,7 @@ app.get(
               method: "GET",
               headers: {
                 Accept: "application/json",
-                "User-Agent": "RobloxCatalogProviderPool/3.0"
+                "User-Agent": `RobloxCatalogProviderPool/${SERVICE_VERSION}`
               },
               agent: provider.agent
             }
@@ -1155,12 +1438,16 @@ app.post(
       });
     }
 
-    const result = await enqueueJob({ kind: "price", items });
+    const debug = req.body?.debug === true;
+    const result = await enqueueJob({ kind: "price", items, debug });
     applyRateLimitHeaders(res, result.rateLimit, result.providerId);
     const body = {
       ...(result.body || { ok: result.ok }),
       selectedProvider: result.providerId,
-      queueDepth: requestQueue.length
+      queueDepth: requestQueue.length,
+      ...(debug
+        ? { providerAttempts: result.providerAttempts || [] }
+        : {})
     };
     return res.status(result.statusCode || 502).json(body);
   })
@@ -1197,15 +1484,17 @@ app.post(
       });
     }
 
+    const debug = req.body?.debug === true;
     const completed = await Promise.all(
       assetIds.map(assetId =>
-        enqueueJob({ kind: "parent", assetId })
+        enqueueJob({ kind: "parent", assetId, debug })
       )
     );
 
     const results = {};
     const upstreamRateLimits = {};
     const selectedProviders = {};
+    const providerAttempts = {};
     let rateLimited = false;
     let summary = null;
 
@@ -1221,6 +1510,10 @@ app.post(
         selectedProvider: completedJob.providerId
       };
       selectedProviders[String(assetId)] = completedJob.providerId;
+      if (debug) {
+        providerAttempts[String(assetId)] =
+          completedJob.providerAttempts || [];
+      }
       if (completedJob.rateLimit) {
         upstreamRateLimits[String(assetId)] = completedJob.rateLimit;
         summary = completedJob.rateLimit;
@@ -1239,6 +1532,7 @@ app.post(
       queueDepth: requestQueue.length,
       rateLimited,
       selectedProviders,
+      ...(debug ? { providerAttempts } : {}),
       upstreamRateLimitSummary: summary || undefined,
       upstreamRateLimits,
       results
@@ -1250,7 +1544,7 @@ app.get("/", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "roblox-catalog-provider-pool",
-    version: "3.0.0",
+    version: SERVICE_VERSION,
     queueDepth: requestQueue.length,
     providerCount: providers.length,
     configuration: {
@@ -1258,6 +1552,10 @@ app.get("/", (req, res) => {
       renderDirectLanes: ENABLE_RENDER_DIRECT
         ? RENDER_DIRECT_LANES
         : 0,
+      requestedRenderDirectLanes: REQUESTED_RENDER_DIRECT_LANES,
+      cloudflareEnabled: ENABLE_CLOUDFLARE,
+      jobTimeoutMs: JOB_TIMEOUT_MS,
+      providerAttemptTimeoutMs: PROVIDER_ATTEMPT_TIMEOUT_MS,
       webshareProviderCount: providers.filter(
         provider => provider.id.startsWith("webshare-")
       ).length,
@@ -1268,6 +1566,9 @@ app.get("/", (req, res) => {
     providers: providers.map(provider => ({
       id: provider.id,
       type: provider.type,
+      priority: provider.priority,
+      supportsPrice: provider.supportsPrice,
+      supportsParent: provider.supportsParent,
       busy: provider.busy,
       cooldownSeconds: Math.max(
         0,
@@ -1304,7 +1605,7 @@ app.use((error, req, res, next) => {
 
 app.listen(port, "0.0.0.0", () => {
   console.log(
-    `Roblox catalog provider pool 3.0.0 listening on port ${port}`
+    `Roblox catalog provider pool ${SERVICE_VERSION} listening on port ${port}`
   );
   console.log(
     `Providers: direct=${ENABLE_RENDER_DIRECT ? RENDER_DIRECT_LANES : 0}, ` +
