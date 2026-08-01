@@ -1,11 +1,12 @@
 {
-  "name": "roblox-catalog-proxy",
-  "version": "2.1.0",
+  "name": "roblox-catalog-provider-pool",
+  "version": "3.0.0",
   "private": true,
-  "description": "Roblox catalog proxy through Webshare",
+  "description": "Queued Roblox catalog proxy with Render direct, Webshare, and remote providers",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node --check index.js"
   },
   "engines": {
     "node": ">=20.0.0"
